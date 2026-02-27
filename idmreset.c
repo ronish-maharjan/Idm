@@ -1,0 +1,330 @@
+#include <stdio.h>
+#include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+
+// All 5 CLSID keys IDM uses
+const char* clsidKeys[] = {
+    "{6DDF00DB-1234-46EC-8356-27E7B2051192}",
+    "{7B8E9164-324D-4A2E-A46D-0165FB2000EC}",
+    "{D5B91409-A8CA-4973-9A0B-59F713D25671}",
+    "{5ED60779-4DE2-4E07-B862-974CA4FF2E9C}",
+    "{07999AC3-058B-40BF-984F-69EB1E554CA7}"
+};
+int numKeys = 5;
+
+// Fresh trial scansk data (from idm_trial.reg)
+BYTE trialScansk[] = {
+    0x91,0x1d,0xac,0xd6,0x90,0x5c,0x42,0xea,0xba,0x1a,0xac,0x08,0x1a,0x18,0x2f,0x16,
+    0x2a,0xa8,0x0a,0xaa,0x24,0xbf,0x0c,0xfc,0x4e,0x7b,0x3b,0x76,0xf7,0x70,0x93,0x58,
+    0x5c,0x03,0x03,0x7e,0x04,0xab,0xb0,0x7e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00
+};
+
+// ===================== HELPER FUNCTIONS =====================
+
+void printOK(const char* msg) {
+    printf("  [+] %s\n", msg);
+}
+void printFail(const char* msg) {
+    printf("  [-] %s (skipping)\n", msg);
+}
+
+BOOL EnablePrivilege(LPCSTR privilege) {
+    HANDLE token;
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return FALSE;
+    if (!LookupPrivilegeValueA(NULL, privilege, &luid)) {
+        CloseHandle(token);
+        return FALSE;
+    }
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    BOOL result = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(token);
+    return result;
+}
+
+BOOL TakeOwnership(HKEY hive, const char* subkey) {
+    HKEY hKey;
+    if (RegOpenKeyExA(hive, subkey, 0, WRITE_OWNER, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    PSID adminSid = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminSid);
+
+    BOOL res = (SetSecurityInfo(hKey, SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION,
+        adminSid, NULL, NULL, NULL) == ERROR_SUCCESS);
+
+    if (adminSid) FreeSid(adminSid);
+    RegCloseKey(hKey);
+    return res;
+}
+
+BOOL SetFullAccess(HKEY hive, const char* subkey) {
+    HKEY hKey;
+    if (RegOpenKeyExA(hive, subkey, 0, WRITE_DAC, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    PSID everyoneSid = NULL;
+    SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
+    AllocateAndInitializeSid(&worldAuth, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &everyoneSid);
+
+    EXPLICIT_ACCESS ea;
+    ZeroMemory(&ea, sizeof(ea));
+    ea.grfAccessPermissions = KEY_ALL_ACCESS;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = (LPSTR)everyoneSid;
+
+    PACL newAcl = NULL;
+    SetEntriesInAclA(1, &ea, NULL, &newAcl);
+
+    BOOL res = (SetSecurityInfo(hKey, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
+        NULL, NULL, newAcl, NULL) == ERROR_SUCCESS);
+
+    if (newAcl) LocalFree(newAcl);
+    if (everyoneSid) FreeSid(everyoneSid);
+    RegCloseKey(hKey);
+    return res;
+}
+
+BOOL SetReadOnly(HKEY hive, const char* subkey) {
+    HKEY hKey;
+    if (RegOpenKeyExA(hive, subkey, 0, WRITE_DAC, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    PSID everyoneSid = NULL;
+    SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
+    AllocateAndInitializeSid(&worldAuth, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &everyoneSid);
+
+    EXPLICIT_ACCESS ea;
+    ZeroMemory(&ea, sizeof(ea));
+    ea.grfAccessPermissions = KEY_READ;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = (LPSTR)everyoneSid;
+
+    PACL newAcl = NULL;
+    SetEntriesInAclA(1, &ea, NULL, &newAcl);
+
+    BOOL res = (SetSecurityInfo(hKey, SE_REGISTRY_KEY,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        NULL, NULL, newAcl, NULL) == ERROR_SUCCESS);
+
+    if (newAcl) LocalFree(newAcl);
+    if (everyoneSid) FreeSid(everyoneSid);
+    RegCloseKey(hKey);
+    return res;
+}
+
+BOOL SetOwnerNobody(HKEY hive, const char* subkey) {
+    HKEY hKey;
+    if (RegOpenKeyExA(hive, subkey, 0, WRITE_OWNER, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    // Nobody = S-1-0-0
+    PSID nobodySid = NULL;
+    SID_IDENTIFIER_AUTHORITY nullAuth = SECURITY_NULL_SID_AUTHORITY;
+    AllocateAndInitializeSid(&nullAuth, 1, SECURITY_NULL_RID, 0, 0, 0, 0, 0, 0, 0, &nobodySid);
+
+    BOOL res = (SetSecurityInfo(hKey, SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION,
+        nobodySid, NULL, NULL, NULL) == ERROR_SUCCESS);
+
+    if (nobodySid) FreeSid(nobodySid);
+    RegCloseKey(hKey);
+    return res;
+}
+
+void UnlockKey(HKEY hive, const char* path) {
+    TakeOwnership(hive, path);
+    SetFullAccess(hive, path);
+}
+
+void LockKey(HKEY hive, const char* path) {
+    SetReadOnly(hive, path);
+    SetOwnerNobody(hive, path);
+}
+
+void WriteScanskValue(HKEY hive, const char* subkey) {
+    HKEY hKey;
+    if (RegCreateKeyExA(hive, subkey, 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, "scansk", 0, REG_NONE, trialScansk, sizeof(trialScansk));
+        RegCloseKey(hKey);
+    }
+}
+
+// ===================== MAIN =====================
+
+int main() {
+    int success = 1;
+    char path[512];
+
+    printf("==========================================\n");
+    printf("         IDM Trial Reset Tool\n");
+    printf("==========================================\n\n");
+
+    // --- Check Admin ---
+    printf("[*] Checking administrator rights...\n");
+    BOOL isAdmin = FALSE;
+    PSID adminSid;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminSid);
+    CheckTokenMembership(NULL, adminSid, &isAdmin);
+    FreeSid(adminSid);
+
+    if (!isAdmin) {
+        printf("  [!] ERROR: Not running as Administrator!\n");
+        printf("  [!] Right-click the EXE and select 'Run as administrator'\n\n");
+        printf("Press Enter to exit...\n");
+        getchar();
+        return 1;
+    }
+    printOK("Running as Administrator");
+
+    // --- Enable Privileges ---
+    printf("\n[*] Step 1/6 - Enabling Windows privileges...\n");
+    if (EnablePrivilege(SE_TAKE_OWNERSHIP_NAME))
+        printOK("SeTakeOwnershipPrivilege enabled");
+    else {
+        printFail("SeTakeOwnershipPrivilege failed");
+        success = 0;
+    }
+    if (EnablePrivilege(SE_RESTORE_NAME))
+        printOK("SeRestorePrivilege enabled");
+    else
+        printFail("SeRestorePrivilege - not critical");
+
+    // --- Unlock All Keys ---
+    printf("\n[*] Step 2/6 - Unlocking protected registry keys...\n");
+    for (int i = 0; i < numKeys; i++) {
+        sprintf(path, "Software\\Classes\\CLSID\\%s", clsidKeys[i]);
+        UnlockKey(HKEY_CURRENT_USER, path);
+        UnlockKey(HKEY_LOCAL_MACHINE, path);
+
+        sprintf(path, "Software\\Classes\\Wow6432Node\\CLSID\\%s", clsidKeys[i]);
+        UnlockKey(HKEY_CURRENT_USER, path);
+        UnlockKey(HKEY_LOCAL_MACHINE, path);
+
+        printf("  [+] Unlocked: %s\n", clsidKeys[i]);
+    }
+
+    // --- Delete All CLSID Keys ---
+    printf("\n[*] Step 3/6 - Deleting CLSID keys...\n");
+    for (int i = 0; i < numKeys; i++) {
+        sprintf(path, "Software\\Classes\\CLSID\\%s", clsidKeys[i]);
+        LONG r1 = RegDeleteKeyA(HKEY_CURRENT_USER, path);
+        LONG r2 = RegDeleteKeyA(HKEY_LOCAL_MACHINE, path);
+
+        sprintf(path, "Software\\Classes\\Wow6432Node\\CLSID\\%s", clsidKeys[i]);
+        LONG r3 = RegDeleteKeyA(HKEY_CURRENT_USER, path);
+        LONG r4 = RegDeleteKeyA(HKEY_LOCAL_MACHINE, path);
+
+        if (r1 == ERROR_SUCCESS || r2 == ERROR_SUCCESS || r3 == ERROR_SUCCESS || r4 == ERROR_SUCCESS)
+            printf("  [+] Deleted: %s\n", clsidKeys[i]);
+        else
+            printf("  [-] Not found (already clean): %s\n", clsidKeys[i]);
+    }
+
+    // --- Clear Registration Info ---
+    printf("\n[*] Step 4/6 - Clearing registration info...\n");
+    HKEY hKey;
+
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\DownloadManager", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "FName");
+        RegDeleteValueA(hKey, "LName");
+        RegDeleteValueA(hKey, "Email");
+        RegDeleteValueA(hKey, "Serial");
+        RegCloseKey(hKey);
+        printOK("Cleared HKCU registration info");
+    } else {
+        printFail("HKCU\\DownloadManager not found");
+    }
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Internet Download Manager", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "FName");
+        RegDeleteValueA(hKey, "LName");
+        RegDeleteValueA(hKey, "Email");
+        RegDeleteValueA(hKey, "Serial");
+        RegCloseKey(hKey);
+        printOK("Cleared HKLM registration info");
+    } else {
+        printFail("HKLM\\Internet Download Manager not found");
+    }
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Wow6432Node\\Internet Download Manager", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "FName");
+        RegDeleteValueA(hKey, "LName");
+        RegDeleteValueA(hKey, "Email");
+        RegDeleteValueA(hKey, "Serial");
+        RegCloseKey(hKey);
+        printOK("Cleared HKLM Wow6432 registration info");
+    } else {
+        printFail("HKLM Wow6432 not found");
+    }
+
+    // --- Write Fresh Trial Data ---
+    printf("\n[*] Step 5/6 - Writing fresh 30-day trial data...\n");
+
+    // Set Serial = "" in DownloadManager
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\DownloadManager", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, "Serial", 0, REG_SZ, (BYTE*)"", 1);
+        RegCloseKey(hKey);
+        printOK("Set fresh Serial value");
+    }
+
+    // Write scansk to the trial key and DownloadManager
+    const char* trialKey = "{5ED60779-4DE2-4E07-B862-974CA4FF2E9C}";
+
+    sprintf(path, "Software\\Classes\\CLSID\\%s", trialKey);
+    WriteScanskValue(HKEY_CURRENT_USER, path);
+    WriteScanskValue(HKEY_LOCAL_MACHINE, path);
+
+    sprintf(path, "Software\\Classes\\Wow6432Node\\CLSID\\%s", trialKey);
+    WriteScanskValue(HKEY_CURRENT_USER, path);
+    WriteScanskValue(HKEY_LOCAL_MACHINE, path);
+
+    WriteScanskValue(HKEY_CURRENT_USER, "Software\\DownloadManager");
+
+    printOK("Written fresh trial scansk values");
+
+    // --- Lock Keys Again ---
+    printf("\n[*] Step 6/6 - Locking keys to prevent IDM from tampering...\n");
+    for (int i = 0; i < numKeys; i++) {
+        sprintf(path, "Software\\Classes\\CLSID\\%s", clsidKeys[i]);
+        LockKey(HKEY_CURRENT_USER, path);
+        LockKey(HKEY_LOCAL_MACHINE, path);
+
+        sprintf(path, "Software\\Classes\\Wow6432Node\\CLSID\\%s", clsidKeys[i]);
+        LockKey(HKEY_CURRENT_USER, path);
+        LockKey(HKEY_LOCAL_MACHINE, path);
+
+        printf("  [+] Locked: %s\n", clsidKeys[i]);
+    }
+
+    // --- Final Result ---
+    printf("\n==========================================\n");
+    if (success) {
+        printf("   SUCCESS! IDM trial reset to 30 days!\n");
+        printf("   Restart IDM if it is currently open.\n");
+    } else {
+        printf("   DONE WITH WARNINGS - check [-] lines\n");
+        printf("   Make sure you ran as Administrator!\n");
+    }
+    printf("==========================================\n\n");
+
+    printf("Press Enter to exit...\n");
+    getchar();
+    return 0;
+}
